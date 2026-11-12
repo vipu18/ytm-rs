@@ -27,8 +27,8 @@ jobs:
           set -euo pipefail
 
           pacman -Syu --noconfirm --needed \
-            base-devel git rust cargo pkgconf clang cmake nasm \
-            openssl alsa-lib gtk3 webkit2gtk-4.1 libxdo \
+            base-devel git rust pkgconf clang cmake nasm \
+            openssl alsa-lib gtk3 webkit2gtk-4.1 xdotool \
             libayatana-appindicator dbus zstd
 
           build_uid=$(stat -c %u /src)
@@ -49,7 +49,7 @@ jobs:
           arch=('x86_64')
           url='https://github.com/vipu18/ytm-rs'
           license=('GPL-3.0-only')
-          depends=('alsa-lib' 'gtk3' 'webkit2gtk-4.1' 'libayatana-appindicator' 'libxdo' 'dbus')
+          depends=('alsa-lib' 'gtk3' 'webkit2gtk-4.1' 'libayatana-appindicator' 'xdotool' 'dbus')
           options=('!debug')
 
           package() {
