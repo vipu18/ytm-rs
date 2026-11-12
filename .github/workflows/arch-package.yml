@@ -1,0 +1,102 @@
+
+name: Build Arch Linux Zstandard Packages
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  build-arch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build on Arch Linux and package with makepkg
+        shell: bash
+        run: |
+          cat > .arch-build.sh <<'SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          pacman -Syu --noconfirm --needed \
+            base-devel git rust cargo pkgconf clang cmake nasm \
+            openssl alsa-lib gtk3 webkit2gtk-4.1 libxdo \
+            libayatana-appindicator dbus zstd
+
+          build_uid=$(stat -c %u /src)
+          useradd -m -u "$build_uid" builder
+
+          runuser -u builder -- cargo build --release --locked
+
+          version=$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)
+          test -n "$version"
+
+          mkdir -p _archpkg dist _portable
+
+          cat > _archpkg/PKGBUILD <<'PKGBUILD'
+          pkgname=ytm-rs
+          pkgver=0.3.0
+          pkgrel=1
+          pkgdesc='Fast, native YouTube Music client'
+          arch=('x86_64')
+          url='https://github.com/vipu18/ytm-rs'
+          license=('GPL-3.0-only')
+          depends=('alsa-lib' 'gtk3' 'webkit2gtk-4.1' 'libayatana-appindicator' 'libxdo' 'dbus')
+          options=('!debug')
+
+          package() {
+            install -Dm755 /src/target/release/ytm-rs "$pkgdir/usr/lib/ytm-rs/ytm-rs"
+            install -d "$pkgdir/usr/bin"
+            ln -s ../lib/ytm-rs/ytm-rs "$pkgdir/usr/bin/ytm-rs"
+
+            install -Dm644 /src/linux/ytm-rs.desktop \
+              "$pkgdir/usr/share/applications/ytm-rs.desktop"
+
+            install -Dm644 /src/assets/icon/icon.png \
+              "$pkgdir/usr/share/icons/hicolor/256x256/apps/ytm-rs.png"
+
+            install -Dm644 /src/LICENSE \
+              "$pkgdir/usr/share/licenses/ytm-rs/LICENSE"
+          }
+          PKGBUILD
+
+          sed -i "s/^pkgver=.*/pkgver=$version/" _archpkg/PKGBUILD
+          chown -R builder:builder _archpkg
+
+          runuser -u builder -- bash -c \
+            'cd /src/_archpkg && makepkg --force --noconfirm --nodeps'
+
+          cp _archpkg/*.pkg.tar.zst dist/
+
+          portable="ytm-rs-portable-${version}-linux-x86_64"
+          mkdir -p "_portable/$portable"
+
+          install -m755 target/release/ytm-rs "_portable/$portable/ytm-rs"
+          cp linux/portable.txt README.md LICENSE "_portable/$portable/"
+
+          tar -I 'zstd -T0 -19' \
+            -cf "dist/$portable.tar.zst" \
+            -C _portable "$portable"
+
+          ls -lh dist
+          SCRIPT
+
+          docker run --rm \
+            -v "$PWD:/src" -w /src \
+            archlinux:latest bash /src/.arch-build.sh
+
+      - name: Upload .zst packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: ytm-rs-arch-linux-zst
+          path: dist/*.zst
+          if-no-files-found: error
+          compression-level: 0
