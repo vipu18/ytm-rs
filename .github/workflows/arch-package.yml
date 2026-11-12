@@ -4,8 +4,12 @@ name: Build Arch Linux Zstandard Packages
 on:
   workflow_dispatch:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
+    paths:
+      - '.github/workflows/arch-package.yml'
 
 permissions:
   contents: read
