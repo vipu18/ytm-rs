@@ -1,0 +1,109 @@
+name: Sync Upstream Release and Build Arch
+
+on:
+  schedule:
+    # Check for new stable upstream releases four times a day (UTC).
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      # Bootstrap the sync when this workflow is first added.
+      - '.github/workflows/sync-upstream-release.yml'
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: upstream-release-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out fork's main branch
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Get upstream latest stable release
+        id: upstream
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          tag="$(gh api repos/grapedjuice/ytm-rs/releases/latest --jq .tag_name)"
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Unexpected upstream stable release tag: $tag"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Latest upstream stable release: $tag"
+
+          # A release with an installable Arch package needs no further work.
+          if gh release view "$tag" --json assets --jq '.assets[].name' 2>/dev/null |
+             grep -qE '\.pkg\.tar\.zst$'; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+            echo "Arch package already published for $tag"
+          fi
+
+      - name: Merge release into fork and create release tag
+        if: steps.upstream.outputs.ready != 'true'
+        shell: bash
+        env:
+          TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream https://github.com/grapedjuice/ytm-rs.git
+          git fetch --no-tags upstream "refs/tags/$TAG"
+          upstream_commit="$(git rev-parse FETCH_HEAD^{commit})"
+          echo "Upstream $TAG commit: $upstream_commit"
+
+          if ! git merge --no-edit --no-ff \
+            -m "Merge upstream ytm-rs $TAG" "$upstream_commit"; then
+            git merge --abort || true
+            echo "::error::Automatic merge conflict for $TAG. Resolve it manually; no files were overwritten."
+            exit 1
+          fi
+
+          # Keep fork-specific workflows and packaging fixes on main.
+          if [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]; then
+            git push origin HEAD:refs/heads/main
+          fi
+
+          # Tag the merged fork code, not the upstream-only commit.
+          if git show-ref --verify --quiet "refs/tags/$TAG"; then
+            echo "Fork tag $TAG already exists."
+          else
+            git tag "$TAG" HEAD
+            git push origin "refs/tags/$TAG"
+          fi
+
+          # The build workflow must be available at this tag.
+          if ! git cat-file -e "$TAG:.github/workflows/arch-package.yml"; then
+            echo "::error::The existing $TAG tag does not include arch-package.yml."
+            exit 1
+          fi
+
+      - name: Dispatch Arch build and release publication
+        if: steps.upstream.outputs.ready != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh workflow run arch-package.yml --ref "$TAG"
+          echo "Dispatched Arch build for $TAG"
+          echo "Track it at https://github.com/$GH_REPO/actions/workflows/arch-package.yml"
