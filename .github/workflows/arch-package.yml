@@ -4,15 +4,11 @@ name: Build Arch Linux Zstandard Packages
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
     tags:
       - 'v*'
-    paths:
-      - '.github/workflows/arch-package.yml'
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build-arch:
@@ -104,3 +100,20 @@ jobs:
           path: dist/*.zst
           if-no-files-found: error
           compression-level: 0
+
+      - name: Publish Arch packages to GitHub Releases
+        if: ${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-nightly.') }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/*.zst --clobber
+          else
+            gh release create "$TAG" dist/*.zst \
+              --title "ytm-rs ${TAG#v}" \
+              --generate-notes --latest
+          fi
