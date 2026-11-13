@@ -7481,12 +7481,13 @@ dependencies = [
 
 [[package]]
 name = "ytm-rs"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
  "bytes",
  "crossbeam-channel",
+ "dbus",
  "directories",
  "discord-rich-presence",
  "eframe",

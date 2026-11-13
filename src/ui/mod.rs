@@ -7,6 +7,7 @@ mod account;
 mod actions;
 mod collections;
 mod colorpick;
+mod comments;
 mod dev;
 mod dialogs;
 mod find;
@@ -58,6 +59,8 @@ pub use queue::Repeat;
 pub enum Page {
     Home,
     Explore,
+    /// A Moods & genres category, by its browse params.
+    Mood(String),
     Library(LibTab),
     Search(String),
     Album(String),
@@ -87,11 +90,12 @@ pub enum LibTab {
 pub enum NpTab {
     Lyrics,
     UpNext,
+    Comments,
     /// Neither panel: just the artwork.
     Art,
 }
 
-pub use mini::init_pill;
+pub use mini::{init_pill, set_hwnd as set_mini_hwnd};
 
 /// Settings › General › Window › Open on: the pages the app can start on, as saved and
 /// as listed.
@@ -294,6 +298,8 @@ pub struct App {
     audio: AudioHandle,
     ch: Channels,
     media: Option<Media>,
+    /// Keeps the computer awake while playing.
+    awake: Option<crate::awake::Awake>,
     discord: Option<crate::discord::Discord>,
     discord_enabled: bool,
     /// Last state sent to Discord, to send only real changes.
@@ -364,6 +370,8 @@ pub struct App {
     home: Option<HomeState>,
     home_loading: bool,
     explore: Option<Explore>,
+    /// The Moods & genres category last opened.
+    mood: Option<crate::ytm::MoodPage>,
     search: Option<SearchResults>,
     /// Albums and playlists opened lately, so going back to one shows it at once (and
     /// refreshes it quietly), and their loads under way.
@@ -429,6 +437,8 @@ pub struct App {
     hide_explicit: bool,
     /// Podcast shows and episodes on Home, in search and in the library.
     show_podcasts: bool,
+    /// Now playing's Comments panel. Off by default.
+    show_comments: bool,
     /// With them, ask YouTube for its Restricted Mode too.
     restricted_mode: bool,
     /// The song version playing in place of the current music video.
@@ -638,6 +648,7 @@ impl App {
         let restricted_mode = get("restricted_mode").is_some_and(|v| v == "1");
         backend.set_hide_explicit(hide_explicit, restricted_mode);
         let show_podcasts = get("podcasts").is_some_and(|v| v == "1");
+        let show_comments = get("comments").is_some_and(|v| v == "1");
         crate::ytm::set_podcasts(show_podcasts);
         backend.request(Req::Home(None));
         let start_choice = start_choice(&get("start_page").unwrap_or_default());
@@ -661,6 +672,7 @@ impl App {
             audio,
             ch,
             media,
+            awake: crate::awake::Awake::spawn(),
             discord: discord_enabled.then(crate::discord::Discord::spawn).flatten(),
             discord_enabled,
             discord_sent: None,
@@ -703,6 +715,7 @@ impl App {
             home: None,
             home_loading: true,
             explore: None,
+            mood: None,
             search: None,
             lists: Lists::default(),
             artist: None,
@@ -747,6 +760,7 @@ impl App {
             hide_search_videos: get("hide_search_videos").is_some_and(|v| v == "1"),
             hide_explicit,
             show_podcasts,
+            show_comments,
             restricted_mode,
             playing_as: None,
             output_device: get("output_device").filter(|d| !d.is_empty()).map(|id| (id, get("output_device_name").unwrap_or_default())),
@@ -896,6 +910,7 @@ impl App {
             Ok("transfer") => app.go(Page::Transfer),
             Ok("jam") => app.go(Page::Jam),
             Ok(p) if p.starts_with("album:") => app.go(Page::Album(p[6..].to_owned())),
+            Ok(p) if p.starts_with("mood:") => app.go(Page::Mood(p[5..].to_owned())),
             Ok(p) if p.starts_with("artist:") => app.go(Page::Artist(p[7..].to_owned())),
             Ok(p) if p.starts_with("playlist:") => app.go(Page::Playlist(p[9..].to_owned())),
             Ok(p) if p.starts_with("search:") => app.go(Page::Search(p[7..].to_owned())),
@@ -913,6 +928,13 @@ impl App {
         }
         if std::env::var("YTM_NOWPLAYING").is_ok() {
             app.np_open = true;
+        }
+        // Dev hook: YTM_NP_TAB=comments|upnext|art opens that panel.
+        match std::env::var("YTM_NP_TAB").as_deref() {
+            Ok("comments") => app.np_tab = NpTab::Comments,
+            Ok("upnext") => app.np_tab = NpTab::UpNext,
+            Ok("art") => app.np_tab = NpTab::Art,
+            _ => {}
         }
         app.jam.name = get("jam_name").unwrap_or_default();
         // Last launch's name, picture and playlists, so they show at once; the account
@@ -1017,6 +1039,7 @@ impl App {
                 Some(Req::Home(None))
             }
             Page::Explore => Some(Req::Explore(self.preferred_artist_ids())),
+            Page::Mood(p) if self.mood.as_ref().is_none_or(|m| &m.params != p) => Some(Req::Mood(p.clone())),
             Page::Search(q) if self.search.as_ref().is_none_or(|s| &s.query != q) => Some(Req::Search(q.clone())),
             Page::Album(id) | Page::Playlist(id) => {
                 self.visit_list(id, matches!(self.page, Page::Album(_)));
@@ -1043,6 +1066,7 @@ impl App {
         let cached = match &self.page {
             Page::Home => self.home.is_some(),
             Page::Explore => self.explore.is_some(),
+            Page::Mood(p) => self.mood.as_ref().is_some_and(|m| &m.params == p),
             Page::Album(id) | Page::Playlist(id) => self.opened(id).is_some(),
             Page::Artist(id) => self.artist.as_ref().is_some_and(|a| &a.id == id),
             Page::Library(LibTab::History) => self.history.is_some(),
@@ -1179,6 +1203,14 @@ impl eframe::App for App {
                 ctx.request_repaint_after(wait);
             }
         }
+        // No sleep while playing, and the screen stays on for a video on show: this song's
+        // (picture in picture keeps the last one's player for a song after it).
+        let video = self.current().filter(|t| self.video_mode(t)).is_some_and(|t| {
+            self.video.as_ref().is_some_and(|(id, p)| *id == t.id && p.as_ref().is_some_and(|p| !p.failed()))
+        });
+        if let Some(a) = &mut self.awake {
+            a.set(crate::awake::Keep::of(playing, video));
+        }
         self.request_lyric_extras();
         // Upload: files from the picker, or dropped onto the window.
         let mut files = self.picked_uploads.lock().unwrap().take().unwrap_or_default();
@@ -1283,12 +1315,12 @@ impl eframe::App for App {
                 ctx.request_repaint_after(Duration::from_millis(250));
             }
         } else if self.np_open && playing && !self.mini.busy() {
-            ctx.request_repaint_after(Duration::from_millis(33));
+            pace::repaint_after(ctx, Duration::from_millis(33));
         } else if playing && widgets::equalizer_shown(ctx) {
             // The playing row's bars need a steady, full rate to read as smooth.
-            ctx.request_repaint_after(Duration::from_millis(16));
+            pace::repaint_after(ctx, Duration::from_millis(16));
         } else if playing && self.anim_bg && shell::pages_bg_moves(self.look()) {
-            ctx.request_repaint_after(Duration::from_millis(66));
+            pace::repaint_after(ctx, Duration::from_millis(66));
         } else if playing || self.buffering {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
@@ -1304,7 +1336,7 @@ impl eframe::App for App {
         self.sync_look();
         let look = self.look();
         // A spring's overshoot isn't for this: it would say "covered" before it is.
-        let np = theme::anim_bool(&ctx, "np-open", self.np_open && self.current().is_some(), look.app.np_open_secs).min(1.0);
+        let np = theme::anim_bool_timed(&ctx, "np-open", self.np_open && self.current().is_some(), look.app.np_open_secs).min(1.0);
         // The pages keep their mode while now playing slides over them. Now playing is dark;
         // once it's most of the way up, so are the player bar and what opens over it.
         theme::set_file_theme(&ctx, self.file_theme());
@@ -1618,6 +1650,7 @@ impl eframe::App for App {
         storage.set_string("hide_search_videos", b(self.hide_search_videos));
         storage.set_string("hide_explicit", b(self.hide_explicit));
         storage.set_string("podcasts", b(self.show_podcasts));
+        storage.set_string("comments", b(self.show_comments));
         storage.set_string("restricted_mode", b(self.restricted_mode));
         let folder = crate::downloads::folder();
         storage.set_string("download_dir", if folder == crate::downloads::default_folder() { String::new() } else { folder.display().to_string() });

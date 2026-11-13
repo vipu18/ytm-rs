@@ -330,8 +330,14 @@ pub fn sidebar(app: &mut App, ui: &mut Ui) {
     // Content width when expanded: text keeps its truncation while the panel narrows.
     let full_w = ui.available_width() + (sidebar_w(app) - rail_w) * t;
 
-    // Menu button, logo
-    ui.horizontal(|ui| {
+    // Menu button, logo. Laid out on its own, with only its height taken here: on the rail
+    // it's wider than the rail, and would widen every row under it past what's seen, their
+    // highlights cut off at the rail's edge.
+    let row_w = ui.available_width();
+    let head_rect = Rect::from_min_size(ui.cursor().min, vec2(row_w, ui.spacing().interact_size.y));
+    let mut head = ui.new_child(egui::UiBuilder::new().max_rect(head_rect).layout(egui::Layout::left_to_right(egui::Align::Center)));
+    {
+        let ui = &mut head;
         ui.spacing_mut().item_spacing.x = 0.0;
         ui.add_space(4.0);
         menu_button(app, ui);
@@ -353,7 +359,8 @@ pub fn sidebar(app: &mut App, ui: &mut Ui) {
         } else {
             logo_name(ui, &logo, app.accent_color());
         }
-    });
+    }
+    ui.allocate_space(vec2(row_w, head.min_rect().height()));
     ui.add_space(22.0);
 
     let mut go_to: Option<Page> = None;
@@ -373,8 +380,6 @@ pub fn sidebar(app: &mut App, ui: &mut Ui) {
         let h = theme::anim_bool(ui.ctx(), resp.id.with("h"), resp.hovered(), 0.15);
         let s = theme::anim_bool(ui.ctx(), resp.id.with("s"), selected, 0.2);
         let rect = rect.shrink2(vec2(item.side_margin, 0.0));
-        // On a rail with labels the row is cut by the rail: keep to what's seen, and centre on it.
-        let rect = if item.rail_labels && t > 0.5 { rect.with_max_x(rect.right().min(ui.clip_rect().right() - 4.0)) } else { rect };
         let fill_rect = if item.hover_zoom != 1.0 { Rect::from_center_size(rect.center(), rect.size() * (1.0 + (item.hover_zoom - 1.0) * h)) } else { rect };
         let icon_fg = nav_bg(ui, look, fill_rect, h, s);
         if item.press > 0.0 && resp.is_pointer_button_down_on() {
@@ -407,7 +412,7 @@ pub fn sidebar(app: &mut App, ui: &mut Ui) {
         }
     };
     nav(ui, icon::HOUSE, "Home", Page::Home, p == Page::Home, &mut go_to);
-    nav(ui, icon::COMPASS, "Explore", Page::Explore, p == Page::Explore, &mut go_to);
+    nav(ui, icon::COMPASS, "Explore", Page::Explore, matches!(p, Page::Explore | Page::Mood(_)), &mut go_to);
     nav(ui, icon::LIBRARY, "Library", Page::Library(LibTab::Playlists), matches!(p, Page::Library(_)), &mut go_to);
     let jam_label = match app.jam.member_count() {
         n if app.jam.active() && n > 0 => format!("Jam · {n} listening"),
@@ -515,9 +520,8 @@ pub fn sidebar(app: &mut App, ui: &mut Ui) {
                     }
                     continue;
                 }
-                // Under the nav's icons, which centre on what's seen of their row on a labelled rail.
-                let seen = rect.shrink2(vec2(item.side_margin, 0.0));
-                let img_x = if item.rail_labels && t > 0.5 { seen.with_max_x(seen.right().min(ui.clip_rect().right() - 4.0)).center().x } else { rect.left() + ICON_X };
+                // Under the nav's icons, which centre on their row on a labelled rail.
+                let img_x = if item.rail_labels && t > 0.5 { rect.shrink2(vec2(item.side_margin, 0.0)).center().x } else { rect.left() + ICON_X };
                 let img = Rect::from_center_size(pos2(img_x, rect.center().y), Vec2::splat(36.0));
                 paint_cover(ui, img, &c.thumbs, theme::thumb_radius(), 1.0);
                 if a > 0.0 {
@@ -1708,37 +1712,45 @@ fn playing_from(app: &mut App, ui: &mut Ui) {
     ui.add_space(8.0);
 }
 
-/// Current track plus everything after it. Shared by the drawer and now playing.
+/// The whole queue, scrolled to the current song when it changes: the songs already
+/// played are above it. Shared by the drawer and now playing.
 pub fn queue_list(app: &mut App, ui: &mut Ui, salt: &str) {
     let rows = super::pages::Rows::new(app, ui.input(|i| i.time));
     let q = app.look().app.queue_look;
     let differs = q.thumb_radius.is_some() || q.radius.is_some() || q.pad.is_some() || q.hover_border.is_some() || q.image_zoom.is_some() || q.image_dim.is_some();
+    if app.queue.tracks.is_empty() {
+        ui.label(egui::RichText::new("Nothing queued yet").color(theme::text_dim()));
+        return;
+    }
+    let start = app.queue.index.unwrap_or(0);
+    // Above the list, so they stay in sight however far up it's scrolled.
+    playing_from(app, ui);
+    ui.horizontal(|ui| {
+        ui.add_space(q.side_pad);
+        ui.checkbox(&mut app.autoplay, egui::RichText::new("Autoplay similar songs").color(theme::text_dim())).on_hover_cursor(egui::CursorIcon::PointingHand);
+    });
+    ui.add_space(6.0);
+    // A new current song (or a new queue) brings it back to the top of the list.
+    let mut area = egui::ScrollArea::vertical().id_salt(("queue", salt)).auto_shrink(false);
+    let shown = egui::Id::unique(("queue-at", salt));
+    let at = (app.queue.index, app.queue.current().map(|t| t.id.clone()));
+    if ui.data(|d| d.get_temp::<(Option<usize>, Option<String>)>(shown)).as_ref() != Some(&at) {
+        ui.data_mut(|d| d.insert_temp(shown, at));
+        area = area.vertical_scroll_offset(start as f32 * widgets::row_height(ui));
+    }
     ui.data_mut(|d| d.insert_temp(egui::Id::unique("in-queue"), differs));
-    egui::ScrollArea::vertical().id_salt(("queue", salt)).auto_shrink(false).show(ui, |ui| {
-        if app.queue.tracks.is_empty() {
-            ui.label(egui::RichText::new("Nothing queued yet").color(theme::text_dim()));
-            return;
-        }
-        let start = app.queue.index.unwrap_or(0);
-        playing_from(app, ui);
-        ui.horizontal(|ui| {
-            ui.add_space(q.side_pad);
-            ui.checkbox(&mut app.autoplay, egui::RichText::new("Autoplay similar songs").color(theme::text_dim())).on_hover_cursor(egui::CursorIcon::PointingHand);
-        });
-        ui.add_space(6.0);
+    area.show(ui, |ui| {
         let accent = app.accent_color();
         let (queue, liked, acts, has_current, by, drag) = (&app.queue.tracks, &app.liked, &mut app.actions, app.queue.index.is_some(), &app.jam.by, &mut app.row_drag);
         // Songs to come can be dragged into another order; in a jam, by the host.
         let (list, movable) = (egui::Id::unique(("queue", salt)), !app.jam.guest());
         let gap = if has_current { q.current_gap } else { 0.0 };
-        // Only the songs below the current one can be dragged to, so they're what it's measured from.
+        // Only the songs below the current one can be dragged to; they're `gap` lower.
         let top = ui.cursor().top() + gap;
-        widgets::visible_rows_gap(ui, queue.len() - start, gap, |ui, k| {
-            let i = start + k;
+        widgets::visible_rows_gap(ui, queue.len(), start, gap, |ui, i| {
             let t = &queue[i];
-            // The first row is the current song.
-            let current = k == 0 && has_current;
-            if movable && !current {
+            let current = i == start && has_current;
+            if movable && (i > start || !has_current) {
                 row_drag::grip(ui, drag, list, i, t);
             }
             let o = widgets::RowOpts { current, added_by: by.get(&t.id).cloned(), ..rows.opts(liked, t, None, false) };
@@ -1759,7 +1771,7 @@ pub fn queue_list(app: &mut App, ui: &mut Ui, salt: &str) {
             }
         });
         let lowest = if has_current { start + 1 } else { start };
-        if let Some(d) = row_drag::feedback(ui, drag, list, row_drag::Rows { top, first: start, lowest, end: queue.len(), accent }) {
+        if let Some(d) = row_drag::feedback(ui, drag, list, row_drag::Rows { top, first: 0, lowest, end: queue.len(), accent }) {
             acts.push(Action::QueueMove { from: d.from, gap: d.gap, id: d.id });
         }
     });
